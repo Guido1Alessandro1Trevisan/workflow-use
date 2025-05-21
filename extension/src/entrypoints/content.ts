@@ -111,6 +111,107 @@ function getEnhancedCSSSelector(element: HTMLElement, xpath: string): string {
   }
 }
 
+// --- Shadow DOM Helpers ---
+function getComposedEventTarget(event: Event): HTMLElement | null {
+  const path = event.composedPath ? event.composedPath() : [];
+  for (const node of path) {
+    if (node instanceof HTMLElement) return node;
+  }
+  return event.target instanceof HTMLElement ? event.target : null;
+}
+
+function buildShadowSelectorChain(element: HTMLElement): string[] {
+  const chain: string[] = [];
+  let node: HTMLElement | null = element;
+  while (node) {
+    const xpath = getXPath(node);
+    chain.unshift(getEnhancedCSSSelector(node, xpath));
+    const root = node.getRootNode();
+    if (root instanceof ShadowRoot) {
+      node = root.host as HTMLElement;
+    } else {
+      node = node.parentElement;
+    }
+  }
+  return chain;
+}
+
+function instrumentShadowRoot(root: ShadowRoot) {
+  root.addEventListener('click',  handleCustomClick  as EventListener, true);
+  root.addEventListener('input',  handleInput        as EventListener, true);
+  root.addEventListener('change', handleSelectChange as EventListener, true);
+  root.addEventListener('keydown',handleKeydown      as EventListener, true);
+  root.querySelectorAll('*').forEach(el => {
+    const child = (el as HTMLElement).shadowRoot;
+    if (child) instrumentShadowRoot(child);
+  });
+}
+
+function scanExistingShadowRoots() {
+  document.querySelectorAll('*').forEach((el) => {
+    const sr = (el as HTMLElement).shadowRoot;
+    if (sr) instrumentShadowRoot(sr);
+  });
+}
+
+// --- NEW: scan closed roots via Chrome extension API (if available) -
+function scanClosedShadowRootsExtension() {
+  const api = (chrome as any).dom?.openOrClosedShadowRoot;
+  if (!api) return;
+  document.querySelectorAll('*').forEach((el) => {
+    try {
+      const sr = api(el);
+      if (sr) instrumentShadowRoot(sr);
+    } catch (_) {/* ignore */}
+  });
+}
+
+// --- Monkey-patch attachShadow (already present) ---
+const origAttachShadow = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function(init: ShadowRootInit): ShadowRoot {
+  const shadow = origAttachShadow.call(this, init);
+  try {
+    instrumentShadowRoot(shadow);
+  } catch (e) {
+    console.error('Error instrumenting shadow root:', e);
+  }
+  return shadow;
+};
+
+// --- NEW: wrap customElements.define to catch constructor shadows ----
+type HTMLElementCtor = new (...args: any[]) => HTMLElement;
+
+// --- Wrap customElements.define to catch constructor shadows -------------
+const origDefine = customElements.define.bind(customElements);
+customElements.define = function (
+  name: string,
+  clazz: HTMLElementCtor,
+  options?: ElementDefinitionOptions
+) {
+  const Wrapped = class extends clazz {
+    constructor(...args: any[]) {
+      super(...args);
+      const sr = (this as any).shadowRoot as ShadowRoot | null;
+      if (sr) instrumentShadowRoot(sr);
+    }
+  };
+
+  // Cast so TS accepts it as a CustomElementConstructor
+  return origDefine(name, Wrapped as unknown as CustomElementConstructor, options);
+};
+
+// --- NEW: MutationObserver safety net for late open roots -----------
+const mo = new MutationObserver((records) => {
+  records.forEach((rec) => {
+    rec.addedNodes.forEach((n) => {
+      if (n instanceof HTMLElement && n.shadowRoot) {
+        instrumentShadowRoot(n.shadowRoot);
+      }
+    });
+  });
+});
+mo.observe(document.documentElement, { childList: true, subtree: true });
+
 function startRecorder() {
   if (stopRecording) {
     console.log('Recorder already running.');
@@ -229,7 +330,7 @@ function stopRecorder() {
 // --- Custom Click Handler ---
 function handleCustomClick(event: MouseEvent) {
   if (!isRecordingActive) return;
-  const targetElement = event.target as HTMLElement;
+  const targetElement = getComposedEventTarget(event);
   if (!targetElement) return;
 
   try {
@@ -239,7 +340,7 @@ function handleCustomClick(event: MouseEvent) {
       url: document.location.href, // Use document.location for main page URL
       frameUrl: window.location.href, // URL of the frame where the event occurred
       xpath: xpath,
-      cssSelector: getEnhancedCSSSelector(targetElement, xpath),
+      cssSelector: buildShadowSelectorChain(targetElement).join(' >> '),
       elementTag: targetElement.tagName,
       elementText: targetElement.textContent?.trim().slice(0, 200) || '',
     };
@@ -257,7 +358,7 @@ function handleCustomClick(event: MouseEvent) {
 // --- Custom Input Handler ---
 function handleInput(event: Event) {
   if (!isRecordingActive) return;
-  const targetElement = event.target as HTMLInputElement | HTMLTextAreaElement;
+  const targetElement = getComposedEventTarget(event) as HTMLInputElement | HTMLTextAreaElement;
   if (!targetElement || !('value' in targetElement)) return;
   const isPassword = targetElement.type === 'password';
 
@@ -268,7 +369,7 @@ function handleInput(event: Event) {
       url: document.location.href,
       frameUrl: window.location.href,
       xpath: xpath,
-      cssSelector: getEnhancedCSSSelector(targetElement, xpath),
+      cssSelector: buildShadowSelectorChain(targetElement).join(' >> '),
       elementTag: targetElement.tagName,
       value: isPassword ? '********' : targetElement.value,
     };
@@ -286,7 +387,7 @@ function handleInput(event: Event) {
 // --- Custom Select Change Handler ---
 function handleSelectChange(event: Event) {
   if (!isRecordingActive) return;
-  const targetElement = event.target as HTMLSelectElement;
+  const targetElement = getComposedEventTarget(event) as HTMLSelectElement;
   // Ensure it's a select element
   if (!targetElement || targetElement.tagName !== 'SELECT') return;
 
@@ -298,7 +399,7 @@ function handleSelectChange(event: Event) {
       url: document.location.href,
       frameUrl: window.location.href,
       xpath: xpath,
-      cssSelector: getEnhancedCSSSelector(targetElement, xpath),
+      cssSelector: buildShadowSelectorChain(targetElement).join(' >> '),
       elementTag: targetElement.tagName,
       selectedValue: targetElement.value,
       selectedText: selectedOption ? selectedOption.text : '', // Get selected option text
@@ -355,14 +456,14 @@ function handleKeydown(event: KeyboardEvent) {
 
   // If we have a key we want to log, send the event
   if (keyToLog) {
-    const targetElement = event.target as HTMLElement;
+    const targetElement = getComposedEventTarget(event) as HTMLElement;
     let xpath = '';
     let cssSelector = '';
     let elementTag = 'document'; // Default if target is not an element
     if (targetElement && typeof targetElement.tagName === 'string') {
       try {
         xpath = getXPath(targetElement);
-        cssSelector = getEnhancedCSSSelector(targetElement, xpath);
+        cssSelector = buildShadowSelectorChain(targetElement).join(' >> ');
         elementTag = targetElement.tagName;
       } catch (e) {
         console.error('Error getting selector for keydown target:', e);
@@ -393,7 +494,12 @@ function handleKeydown(event: KeyboardEvent) {
 
 export default defineContentScript({
   matches: ['<all_urls>'],
+  runAt: 'document_start',
   main(ctx) {
+    // NEW: Instrument shadow DOMs that already exist
+    scanExistingShadowRoots();
+    scanClosedShadowRootsExtension();
+
     // Listener for status updates from the background script
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message.type === 'SET_RECORDING_STATUS') {
@@ -436,25 +542,11 @@ export default defineContentScript({
 
     // Optional: Clean up recorder if the page is unloading
     window.addEventListener('beforeunload', () => {
-      // Also remove permanent listeners on unload?
-      // Might not be strictly necessary as the page context is destroyed,
-      // but good practice if the script could somehow persist.
       document.removeEventListener('click', handleCustomClick, true);
       document.removeEventListener('input', handleInput, true);
       document.removeEventListener('change', handleSelectChange, true);
       document.removeEventListener('keydown', handleKeydown, true);
       stopRecorder(); // Ensure rrweb is stopped
     });
-
-    // Optional: Log when the content script is injected
-    // console.log("rrweb recorder injected into:", window.location.href);
-
-    // Listener for potential messages from popup/background if needed later
-    // chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    //   if (msg.type === 'GET_EVENTS') {
-    //     sendResponse(events);
-    //   }
-    //   return true; // Keep the message channel open for asynchronous response
-    // });
   },
 });
